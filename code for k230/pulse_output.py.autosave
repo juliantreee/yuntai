@@ -1,0 +1,21 @@
+import time
+from machine import PWM, Pin
+
+PULSE_COUNT = 3200
+FREQUENCY = 32000  # 64kHz
+DURATION = PULSE_COUNT / FREQUENCY  # 1.25s
+
+# 1. 先将GPIO41设为高电平
+pin46 = Pin(46, Pin.OUT)
+pin46.value(0)
+print("GPIO41 set to HIGH")
+
+# 2. 在GPIO40上以64kHz发送80000个脉冲
+pwm42 = PWM(Pin(42), freq=FREQUENCY, duty=50)
+print(f"Sending {PULSE_COUNT} pulses at {FREQUENCY}Hz for {DURATION}s...")
+
+time.sleep(DURATION)
+
+# 3. 停止PWM，释放资源
+pwm42.deinit()
+print("Done")
