@@ -250,7 +250,7 @@ try:
     sensor = Sensor()
     sensor.reset()
     sensor.set_framesize(Sensor.QVGA)
-    sensor.set_pixformat(Sensor.RGB565)
+    sensor.set_pixformat(Sensor.GRAYSCALE)
     time.sleep(1)
 
     Display.init(Display.ST7701, width=800, height=480, to_ide=True)
