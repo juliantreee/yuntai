@@ -527,10 +527,11 @@ try:
         if min_corners is not None and flag_detected:
             ctl_x = pid_x.step(dx_center, 0)
             ctl_y = pid_y.step(dy_center, 0)
-            print(dy_center)
         else:
-            ctl_x = pid_x.step(TARGET_POINT[0], TARGET_POINT[0])
-            ctl_y = pid_y.step(TARGET_POINT[1], TARGET_POINT[1])
+            pid_x.step(TARGET_POINT[0], TARGET_POINT[0])
+            pid_y.step(TARGET_POINT[1], TARGET_POINT[1])
+            ctl_x = 0
+            ctl_y = 0
 
         x_motor_speed(ctl_x)
         y_motor_speed(ctl_y)
