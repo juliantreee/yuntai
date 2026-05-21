@@ -1,0 +1,5 @@
+F:/download/k230resource/git/yuntai/code_for_stm32/Core/Src/stm32f1xx_hal_msp.c:62:6:HAL_MspInit	24	static
+F:/download/k230resource/git/yuntai/code_for_stm32/Core/Src/stm32f1xx_hal_msp.c:89:6:HAL_TIM_Base_MspInit	24	static
+F:/download/k230resource/git/yuntai/code_for_stm32/Core/Src/stm32f1xx_hal_msp.c:125:6:HAL_TIM_Base_MspDeInit	16	static
+F:/download/k230resource/git/yuntai/code_for_stm32/Core/Src/stm32f1xx_hal_msp.c:161:6:HAL_UART_MspInit	56	static
+F:/download/k230resource/git/yuntai/code_for_stm32/Core/Src/stm32f1xx_hal_msp.c:257:6:HAL_UART_MspDeInit	16	static

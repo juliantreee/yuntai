@@ -1,0 +1,5 @@
+"F:\CLion 2025.3.3\bin\cmake\win\x64\bin\cmake.exe" -DCMAKE_BUILD_TYPE=Debug --preset Debug -S F:\download\k230resource\git\yuntai\code_for_stm32 -B F:\download\k230resource\git\yuntai\code_for_stm32\build\Debug
+Build type: Debug
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: F:/download/k230resource/git/yuntai/code_for_stm32/build/Debug
