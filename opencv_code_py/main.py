@@ -420,12 +420,12 @@ class RectangleDetector:
 def main() -> None:
     try:
         # ========== 配置区 ==========
-         #选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
-        detector = RectangleDetector(source=0)
+        #选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
+        #detector = RectangleDetector(source=0)
 
         # 选择2：使用视频文件（修改为你的视频路径）
-        #video_path = "test.mp4"  # 👈 改成你的视频文件路径
-        #detector = RectangleDetector(source=video_path, is_video_file=True)
+        video_path = "test.mp4"  # 👈 改成你的视频文件路径
+        detector = RectangleDetector(source=video_path, is_video_file=True)
         # ============================
 
         detector.run(display=True)
