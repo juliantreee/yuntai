@@ -420,7 +420,11 @@ class RectangleDetector:
 def main() -> None:
     try:
         # ========== 配置区 ==========
+<<<<<<< HEAD
         #选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
+=======
+        # 选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
+>>>>>>> parent of 119cc90 (opencv_fixed)
         #detector = RectangleDetector(source=0)
 
         # 选择2：使用视频文件（修改为你的视频路径）
