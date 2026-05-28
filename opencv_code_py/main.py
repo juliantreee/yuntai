@@ -664,7 +664,19 @@ class RectangleDetector:
 def main() -> None:
     detector = None
     try:
+<<<<<<< HEAD
         detector = RectangleDetector(source=11, enable_pid=True)
+=======
+        # ========== 配置区 ==========
+        #选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
+        #detector = RectangleDetector(source=0)
+
+        # 选择2：使用视频文件（修改为你的视频路径）
+        video_path = "test.mp4"  # 👈 改成你的视频文件路径
+        detector = RectangleDetector(source=video_path, is_video_file=True)
+        # ============================
+
+>>>>>>> 290efde1abbb2a8e44a954d0fdc6102fe74220f0
         detector.run(display=True)
     except Exception as e:
         print(f"错误: {e}")
