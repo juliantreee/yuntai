@@ -10,8 +10,7 @@ import cv2
 import numpy as np
 import time
 import threading
-from collections import deque
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Any, Union
 
 from pwm_control import PWMMotor
 
@@ -166,6 +165,7 @@ class PIDControlLoop:
     def _loop(self):
         period = PID_DT
         next_cycle = time.perf_counter()
+        _was_lost = False
 
         while self._running:
             with self._lock:
@@ -174,12 +174,17 @@ class PIDControlLoop:
                 has_target = self._has_target
 
             if has_target:
+                _was_lost = False
                 ctl_x = self.pid_x.step(ox, 0)
                 ctl_y = self.pid_y.step(oy, 0)
             else:
-                # 无目标时将当前值同时作为 value 和 target, 误差=0, PID 保持
-                ctl_x = self.pid_x.step(0, 0)
-                ctl_y = self.pid_y.step(0, 0)
+                # 目标丢失: 清零 PID 防止 D 项尖峰, 电机立即停止
+                if not _was_lost:
+                    self.pid_x.clear()
+                    self.pid_y.clear()
+                    _was_lost = True
+                ctl_x = 0.0
+                ctl_y = 0.0
 
             self.motor_x.set_speed(ctl_x)
             self.motor_y.set_speed(ctl_y)
@@ -191,6 +196,81 @@ class PIDControlLoop:
                 time.sleep(delay - 0.0005)
             while time.perf_counter() < next_cycle:
                 pass
+
+
+# ============================================================
+# Kalman 滤波器 — 恒速模型, 用于位置预测与防丢失
+# ============================================================
+
+class KalmanTracker:
+    """6-state (cx, cy, vx, vy, w, h) constant-velocity Kalman filter for rectangle tracking."""
+
+    def __init__(self,
+                 process_noise: float = 0.03,
+                 measurement_noise: float = 0.1,
+                 velocity_decay: float = 0.85):
+        self.kf = cv2.KalmanFilter(6, 4)
+        # State: [cx, cy, vx, vy, w, h]
+        # Measurement: [cx, cy, w, h]
+
+        dt = 1.0  # frame-to-frame
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0,  0, 0],
+            [0, 1, 0,  dt, 0, 0],
+            [0, 0, 1,  0,  0, 0],
+            [0, 0, 0,  1,  0, 0],
+            [0, 0, 0,  0,  1, 0],
+            [0, 0, 0,  0,  0, 1],
+        ], np.float32)
+
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], np.float32)
+
+        self.kf.processNoiseCov = np.eye(6, dtype=np.float32) * process_noise
+        self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * measurement_noise
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32)
+
+        self.initialized = False
+        self.missed_frames = 0
+        self.velocity_decay = velocity_decay
+        self._last_state = None
+
+    def predict(self) -> np.ndarray:
+        """Predict next state. During consecutive misses, decay velocity."""
+        if self.missed_frames > 0 and self._last_state is not None:
+            # 修改 statePost 的速度, 让衰减跨帧累积 (predict 会 statePre=T*statePost)
+            decay = self.velocity_decay ** self.missed_frames
+            self.kf.statePost[2, 0] = self._last_state[2, 0] * decay
+            self.kf.statePost[3, 0] = self._last_state[3, 0] * decay
+        return self.kf.predict()
+
+    def correct(self, measurement: np.ndarray) -> np.ndarray:
+        """Update with measurement."""
+        self.initialized = True
+        self.missed_frames = 0
+        result = self.kf.correct(measurement)
+        self._last_state = self.kf.statePost.copy()
+        return result
+
+    def init_state(self, cx: float, cy: float, w: float, h: float):
+        """Initialize filter state on first detection."""
+        self.kf.statePost = np.array([[cx], [cy], [0], [0], [w], [h]], np.float32)
+        self.kf.statePre = self.kf.statePost.copy()
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32) * 0.5
+        self._last_state = self.kf.statePost.copy()
+        self.initialized = True
+        self.missed_frames = 0
+
+    def reset(self):
+        """Reset filter to uninitialized state."""
+        self.initialized = False
+        self.missed_frames = 0
+        self._last_state = None
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32)
 
 
 # ============================================================
@@ -228,15 +308,17 @@ class RectangleDetector:
         self.blur_kernel_size = 5
         self.track_largest = True
 
-        self.smoothing_window = 5
-        self.position_history = deque(maxlen=self.smoothing_window)
-        self.size_history = deque(maxlen=self.smoothing_window)
-        self.detection_threshold = 3
-        self.detection_counter = 0
-        self.last_valid_rect = None
-        self.max_disappear_frames = 10
+        # Kalman 跟踪 & 防丢失
+        self._kf = KalmanTracker(
+            process_noise=0.05,       # 增大 → 对快速运动响应更快
+            measurement_noise=0.15,   # 增大 → 平滑更强
+            velocity_decay=0.80,      # 丢失时速度衰减率 (每帧乘0.8)
+        )
+        self.max_disappear_frames = 20    # 纯预测最多持续帧数 (30fps ≈ 0.67s)
         self.disappear_counter = 0
+        self.last_valid_rect = None
         self.smoothed_rect = None
+        self.detection_counter = 0        # 仅用于显示
 
         # PID 控制
         self._enable_pid = enable_pid
@@ -355,70 +437,117 @@ class RectangleDetector:
 
         return rectangles, edges
 
+    def _build_output_rect(self, source_rect: dict, cx: float, cy: float,
+                           w: float, h: float, vx: float = 0, vy: float = 0,
+                           predicted: bool = False) -> dict:
+        """Build a result rect dict from Kalman state, preserving inner_rect offsets."""
+        out = source_rect.copy()
+        out['center_x'] = int(cx)
+        out['center_y'] = int(cy)
+        out['offset_x'] = int(cx) - self.frame_center_x
+        out['offset_y'] = int(cy) - self.frame_center_y
+        w_int, h_int = max(10, int(w)), max(10, int(h))
+        out['width'] = w_int
+        out['height'] = h_int
+        out['x'] = int(cx) - w_int // 2
+        out['y'] = int(cy) - h_int // 2
+        out['velocity_x'] = vx
+        out['velocity_y'] = vy
+        out['predicted'] = predicted
+
+        if source_rect.get('inner_rect') is not None:
+            inner = source_rect['inner_rect']
+            old_cx = source_rect['center_x']
+            old_cy = source_rect['center_y']
+            old_w = source_rect['width']
+            old_h = source_rect['height']
+            rel_dx = inner['center_x'] - old_cx
+            rel_dy = inner['center_y'] - old_cy
+            w_ratio = inner['width'] / old_w if old_w > 0 else 0
+            h_ratio = inner['height'] / old_h if old_h > 0 else 0
+            inr = inner.copy()
+            inr['center_x'] = int(cx) + int(rel_dx)
+            inr['center_y'] = int(cy) + int(rel_dy)
+            inr['width'] = max(5, int(w_int * w_ratio))
+            inr['height'] = max(5, int(h_int * h_ratio))
+            inr['x'] = inr['center_x'] - inr['width'] // 2
+            inr['y'] = inr['center_y'] - inr['height'] // 2
+            inr['offset_x'] = inr['center_x'] - self.frame_center_x
+            inr['offset_y'] = inr['center_y'] - self.frame_center_y
+            out['inner_rect'] = inr
+        return out
+
     def smooth_detection(self, rectangles):
-        if len(rectangles) == 0:
-            self.disappear_counter += 1
-            if self.last_valid_rect is not None and self.disappear_counter <= self.max_disappear_frames:
-                return [self.last_valid_rect]
-            else:
-                self.position_history.clear()
-                self.size_history.clear()
-                self.detection_counter = 0
-                return []
+        """Kalman-filtered tracking: 零延迟确认 + 速度预测防丢失."""
+
+        # ---- 1. Kalman 预测 ----
+        if self._kf.initialized:
+            predicted = self._kf.predict()
+            pred_cx = predicted[0, 0]
+            pred_cy = predicted[1, 0]
+            pred_vx = predicted[2, 0]
+            pred_vy = predicted[3, 0]
+            pred_w = predicted[4, 0]
+            pred_h = predicted[5, 0]
         else:
-            self.disappear_counter = 0
+            pred_cx = pred_cy = pred_vx = pred_vy = None
+            pred_w = pred_h = None
+
+        # ---- 2. 有检测 → 立即更新 Kalman, 无确认延迟 ----
+        if len(rectangles) > 0:
             current_rect = rectangles[0]
+            meas_cx = float(current_rect['center_x'])
+            meas_cy = float(current_rect['center_y'])
+            meas_w = float(current_rect['width'])
+            meas_h = float(current_rect['height'])
 
-            if self.last_valid_rect is not None:
-                iou = self.calculate_iou(current_rect, self.last_valid_rect)
-                if iou < 0.3:
-                    self.detection_counter = 0
+            if not self._kf.initialized:
+                self._kf.init_state(meas_cx, meas_cy, meas_w, meas_h)
+                self.disappear_counter = 0
+                self.detection_counter = 1
+                result = self._build_output_rect(current_rect, meas_cx, meas_cy, meas_w, meas_h)
+                self.smoothed_rect = result
+                self.last_valid_rect = result
+                return [result]
 
-            self.detection_counter = min(self.detection_counter + 1, self.detection_threshold)
-            self.position_history.append((current_rect['center_x'], current_rect['center_y']))
-            self.size_history.append((current_rect['width'], current_rect['height']))
+            # Kalman 更新
+            measurement = np.array([[meas_cx], [meas_cy], [meas_w], [meas_h]], np.float32)
+            corrected = self._kf.correct(measurement)
 
-            if self.detection_counter >= self.detection_threshold:
-                if len(self.position_history) > 0:
-                    avg_center_x = int(np.mean([p[0] for p in self.position_history]))
-                    avg_center_y = int(np.mean([p[1] for p in self.position_history]))
-                    avg_width = int(np.mean([s[0] for s in self.size_history]))
-                    avg_height = int(np.mean([s[1] for s in self.size_history]))
+            kf_cx = corrected[0, 0]
+            kf_cy = corrected[1, 0]
+            kf_vx = corrected[2, 0]
+            kf_vy = corrected[3, 0]
+            kf_w = corrected[4, 0]
+            kf_h = corrected[5, 0]
 
-                    smoothed = current_rect.copy()
-                    smoothed['center_x'] = avg_center_x
-                    smoothed['center_y'] = avg_center_y
-                    smoothed['offset_x'] = avg_center_x - self.frame_center_x
-                    smoothed['offset_y'] = avg_center_y - self.frame_center_y
-                    smoothed['width'] = avg_width
-                    smoothed['height'] = avg_height
-                    smoothed['x'] = avg_center_x - avg_width // 2
-                    smoothed['y'] = avg_center_y - avg_height // 2
+            result = self._build_output_rect(current_rect, kf_cx, kf_cy, kf_w, kf_h, kf_vx, kf_vy)
+            self.disappear_counter = 0
+            self.detection_counter = min(self.detection_counter + 1, 999)
+            self.smoothed_rect = result
+            self.last_valid_rect = result
+            return [result]
 
-                    if current_rect.get('inner_rect') is not None:
-                        inner = current_rect['inner_rect']
-                        dx = inner['center_x'] - current_rect['center_x']
-                        dy = inner['center_y'] - current_rect['center_y']
-                        w_ratio = inner['width'] / current_rect['width'] if current_rect['width'] > 0 else 0
-                        h_ratio = inner['height'] / current_rect['height'] if current_rect['height'] > 0 else 0
-                        smoothed_inner = inner.copy()
-                        smoothed_inner['center_x'] = avg_center_x + int(dx)
-                        smoothed_inner['center_y'] = avg_center_y + int(dy)
-                        smoothed_inner['width'] = int(avg_width * w_ratio)
-                        smoothed_inner['height'] = int(avg_height * h_ratio)
-                        smoothed_inner['x'] = smoothed_inner['center_x'] - smoothed_inner['width'] // 2
-                        smoothed_inner['y'] = smoothed_inner['center_y'] - smoothed_inner['height'] // 2
-                        smoothed_inner['offset_x'] = smoothed_inner['center_x'] - self.frame_center_x
-                        smoothed_inner['offset_y'] = smoothed_inner['center_y'] - self.frame_center_y
-                        smoothed['inner_rect'] = smoothed_inner
+        # ---- 3. 无检测 → Kalman 纯预测 (速度衰减) ----
+        self.disappear_counter += 1
+        self._kf.missed_frames = self.disappear_counter
+        self.detection_counter = 0
 
-                    self.smoothed_rect = smoothed
-                    self.last_valid_rect = smoothed
-                    return [smoothed]
+        if self._kf.initialized and self.disappear_counter <= self.max_disappear_frames:
+            # 使用节1已预测的值 (predict 已含速度衰减)
+            if self.last_valid_rect is not None and pred_cx is not None:
+                result = self._build_output_rect(
+                    self.last_valid_rect, pred_cx, pred_cy, pred_w, pred_h,
+                    predicted=True,
+                )
+                self.smoothed_rect = result
+                return [result]
 
-            if self.last_valid_rect is not None:
-                return [self.last_valid_rect]
-            return []
+        # 超时 → 重置 Kalman, 上报丢失
+        self._kf.reset()
+        self.last_valid_rect = None
+        self.smoothed_rect = None
+        return []
 
     def draw_result(self, frame: np.ndarray, rectangles: List[Dict[str, Any]],
                     target_index: int = 0, paused: bool = False) -> np.ndarray:
@@ -456,10 +585,14 @@ class RectangleDetector:
                 cv2.circle(result_frame, (sr['center_x'], sr['center_y']),
                            6, (0, 255, 0), -1)
 
-                # 显示 ox/oy (PID 输入)
+                # 显示 ox/oy + 速度 (PID 输入)
                 ox = sr['offset_x']
                 oy = sr['offset_y']
-                cv2.putText(result_frame, f"ox: {ox:+d}  oy: {oy:+d}",
+                vx = sr.get('velocity_x', 0)
+                vy = sr.get('velocity_y', 0)
+                pred_flag = " [PRED]" if sr.get('predicted') else ""
+                cv2.putText(result_frame,
+                            f"ox: {ox:+d} oy: {oy:+d}  vx: {vx:+.0f} vy: {vy:+.0f}{pred_flag}",
                             (10, result_frame.shape[0] - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
@@ -468,7 +601,7 @@ class RectangleDetector:
                 cv2.drawContours(result_frame, [target_rect['inner_rect']['contour']], -1,
                                  (0, 0, 255), 1)
 
-        status_text = f"Detections: {self.detection_counter}/{self.detection_threshold}"
+        status_text = f"Detect: {self.detection_counter}  KF: {'on' if self._kf.initialized else 'off'}"
         cv2.putText(result_frame, status_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
@@ -516,9 +649,10 @@ class RectangleDetector:
         print("按键控制:")
         print("  'q' - 退出")
         print("  '空格' - 暂停/继续")
-        print("  '+' - 增大最小面积")
-        print("  '-' - 减小最小面积")
-        print("  'w'/'s' - 平滑窗口 +/-")
+        print("  '+'/'-' - 最小面积 +/-")
+        print("  'w'/'s' - Kalman process_noise +/- (响应/平滑)")
+        print("  't'/'y' - Kalman meas_noise +/- (平滑/响应)")
+        print("  'u' - 重置 Kalman")
         print("  'a'/'z' - Kp_x +/-")
         print("  'd'/'c' - Ki_x +/-")
         print("  'f'/'v' - Kd_x +/-")
@@ -542,13 +676,15 @@ class RectangleDetector:
                     last_edges = edges.copy() if edges is not None else None
                     last_rectangles = smoothed_rectangles
 
-                    # 更新 PID 目标
+                    # 更新 PID 目标 (预测框不驱动电机, 防止偏离)
                     if len(smoothed_rectangles) > 0:
                         target_rect = smoothed_rectangles[0]
+                        is_predicted = target_rect.get('predicted', False)
                         ox = target_rect['offset_x']
                         oy = -target_rect['offset_y']  # 图像 y 轴翻转
                         if self._pid_loop is not None:
-                            self._pid_loop.update_target(ox, oy, True)
+                            # 仅真实检测驱动电机; 预测仅用于 Kalman 内部状态保持
+                            self._pid_loop.update_target(ox, oy, not is_predicted)
                     else:
                         if self._pid_loop is not None:
                             self._pid_loop.update_target(0, 0, False)
@@ -587,15 +723,28 @@ class RectangleDetector:
                     self.min_area = max(100, self.min_area - 500)
                     print(f"最小面积: {self.min_area}")
                 elif key == ord('w'):
-                    self.smoothing_window += 1
-                    self.position_history = deque(maxlen=self.smoothing_window)
-                    self.size_history = deque(maxlen=self.smoothing_window)
-                    print(f"平滑窗口: {self.smoothing_window}")
+                    self._kf.kf.processNoiseCov *= 1.3
+                    pn = self._kf.kf.processNoiseCov[0, 0]
+                    print(f"Kalman process_noise: {pn:.4f} (响应更快)")
                 elif key == ord('s'):
-                    self.smoothing_window = max(1, self.smoothing_window - 1)
-                    self.position_history = deque(maxlen=self.smoothing_window)
-                    self.size_history = deque(maxlen=self.smoothing_window)
-                    print(f"平滑窗口: {self.smoothing_window}")
+                    self._kf.kf.processNoiseCov *= 0.7
+                    pn = self._kf.kf.processNoiseCov[0, 0]
+                    print(f"Kalman process_noise: {pn:.4f} (更平滑)")
+                elif key == ord('t'):
+                    self._kf.kf.measurementNoiseCov *= 1.3
+                    mn = self._kf.kf.measurementNoiseCov[0, 0]
+                    print(f"Kalman meas_noise: {mn:.4f} (更平滑)")
+                elif key == ord('y'):
+                    self._kf.kf.measurementNoiseCov *= 0.7
+                    mn = self._kf.kf.measurementNoiseCov[0, 0]
+                    print(f"Kalman meas_noise: {mn:.4f} (响应更快)")
+                elif key == ord('u'):
+                    self._kf.reset()
+                    self.last_valid_rect = None
+                    self.smoothed_rect = None
+                    self.disappear_counter = 0
+                    self.detection_counter = 0
+                    print("Kalman 已重置")
                 # ---- PID 增益调节 ----
                 elif self._pid_loop is not None and key == ord('a'):
                     self._pid_loop.adjust_gain('x', 'kp', +PID_KP_STEP)
@@ -664,23 +813,15 @@ class RectangleDetector:
 def main() -> None:
     detector = None
     try:
-<<<<<<< HEAD
-        detector = RectangleDetector(source=11, enable_pid=True)
-=======
         # ========== 配置区 ==========
-<<<<<<< HEAD
-        #选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
-=======
-        # 选择1：使用摄像头（取消注释下面这行，注释视频文件那行）
->>>>>>> parent of 119cc90 (opencv_fixed)
-        #detector = RectangleDetector(source=0)
+        # 选择1：使用摄像头
+        detector = RectangleDetector(source=11, enable_pid=True)
 
-        # 选择2：使用视频文件（修改为你的视频路径）
-        video_path = "test.mp4"  # 👈 改成你的视频文件路径
-        detector = RectangleDetector(source=video_path, is_video_file=True)
+        # 选择2：使用视频文件（取消注释下面两行，注释上面那行）
+        # video_path = "test.mp4"
+        # detector = RectangleDetector(source=video_path, is_video_file=True, enable_pid=False)
         # ============================
 
->>>>>>> 290efde1abbb2a8e44a954d0fdc6102fe74220f0
         detector.run(display=True)
     except Exception as e:
         print(f"错误: {e}")
