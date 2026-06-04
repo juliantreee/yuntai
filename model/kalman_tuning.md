@@ -139,6 +139,29 @@ P_post = (1 - K) × P_pred  (更新步)
 
 ---
 
+## PID 控制参数
+
+### 参数表
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `PID_FREQ` | 200 Hz | 控制频率，dt=0.005s |
+| `PID_X_KP` | 1.7 | X轴比例增益 |
+| `PID_X_KI` | 0.4 | X轴积分增益 |
+| `PID_X_KD` | 0.10 | X轴微分增益 |
+| `PID_Y_KP` | 1.4 | Y轴比例增益 |
+| `PID_Y_KI` | 0.4 | Y轴积分增益 |
+| `PID_Y_KD` | 0.10 | Y轴微分增益 |
+| `PID_MAX/MIN` | ±3000 | 输出限幅 (RPM) |
+| `PID_ERROR_CLAMP` | 120 | 误差钳位 (px)，限制转弯时 PID 输入 |
+
+### 误差钳位说明
+
+转弯时目标偏移可达数百像素，`PID_ERROR_CLAMP` 将误差限制在 ±120px 以内，
+防止 PID 输出过大导致电机高速转动。配合降低后的 Kp，P项最大输出 ≈ 0.8×120 = 96 RPM。
+
+---
+
 ## 键盘快捷键速查
 
 | 按键 | 作用 |
@@ -147,17 +170,35 @@ P_post = (1 - K) × P_pred  (更新步)
 | `t` / `y` | measurement_noise 增大/减小 |
 | `u` | 重置 Kalman 状态 |
 | `a` / `z` | PID X 轴 Kp 增大/减小 |
+| `d` / `c` | PID X 轴 Ki 增大/减小 |
+| `f` / `v` | PID X 轴 Kd 增大/减小 |
 | `g` / `b` | PID Y 轴 Kp 增大/减小 |
+| `h` / `n` | PID Y 轴 Ki 增大/减小 |
+| `j` / `m` | PID Y 轴 Kd 增大/减小 |
+| `o` / `l` | 误差钳位 ±10 |
+| `r` | 清零 PID 积分 |
+| `空格` | 暂停/继续 |
+| `q` | 退出 |
 
 ---
 
 ## 当前初始值
 
 ```python
+# Kalman
 process_noise    = 0.05
 measurement_noise = 0.15
 velocity_decay    = 0.80
 max_disappear_frames = 20   # ~0.67秒 @30fps
+
+# PID
+PID_X_KP = 0.8      PID_Y_KP = 0.7
+PID_X_KI = 0.15     PID_Y_KI = 0.15
+PID_X_KD = 0.10     PID_Y_KD = 0.10
+PID_MAX  = 800      PID_MIN  = -800
+PID_ERROR_CLAMP = 120
 ```
 
-偏平滑的配置，适合检测有一定噪声、目标中低速运动的场景。
+偏平滑的配置：
+- Kalman 适合检测有一定噪声、目标中低速运动的场景
+- PID 降低增益 + 误差钳位，避免转弯时电机高速转动

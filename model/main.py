@@ -48,6 +48,9 @@ PID_Y_KD = 0.1
 PID_MAX = 3000
 PID_MIN = -3000
 
+# 误差钳位: 转弯时画面偏移可达几百像素, 限制输入避免 PID 输出过大导致高速转动
+PID_ERROR_CLAMP = 120
+
 # 增益调节步长
 PID_KP_STEP = 0.01
 PID_KI_STEP = 0.005
@@ -59,7 +62,7 @@ PID_KD_STEP = 0.001
 # ============================================================
 
 class PID:
-    def __init__(self, kp, ki, kd, ctl_max, ctl_min, dt):
+    def __init__(self, kp, ki, kd, ctl_max, ctl_min, dt, error_clamp=None):
         self.Kp = kp
         self.Ki = ki
         self.Kd = kd
@@ -73,6 +76,7 @@ class PID:
         self.ctl_max = ctl_max
         self.ctl_min = ctl_min
         self.dt = dt
+        self.error_clamp = error_clamp
         self.first = True
 
     def clear(self):
@@ -84,13 +88,19 @@ class PID:
         self.ctl_max = max_val
         self.ctl_min = min_val
 
+    def set_error_clamp(self, clamp):
+        self.error_clamp = clamp
+
     def step(self, value, target):
         if self.first:
             self.last_value = value
             self.first = False
         self.now_value = value
         self.target_value = target
-        self.error = self.target_value - self.now_value
+        raw_error = self.target_value - self.now_value
+        self.error = raw_error
+        if self.error_clamp is not None:
+            self.error = max(-self.error_clamp, min(self.error_clamp, raw_error))
         self.ierror += self.error * self.dt
         self.dvalue = (self.now_value - self.last_value) / self.dt
         self.ctl_value = (self.Kp * self.error +
@@ -117,8 +127,8 @@ class PIDControlLoop:
         self.motor_x = motor_x
         self.motor_y = motor_y
 
-        self.pid_x = PID(PID_X_KP, PID_X_KI, PID_X_KD, PID_MAX, PID_MIN, PID_DT)
-        self.pid_y = PID(PID_Y_KP, PID_Y_KI, PID_Y_KD, PID_MAX, PID_MIN, PID_DT)
+        self.pid_x = PID(PID_X_KP, PID_X_KI, PID_X_KD, PID_MAX, PID_MIN, PID_DT, PID_ERROR_CLAMP)
+        self.pid_y = PID(PID_Y_KP, PID_Y_KI, PID_Y_KD, PID_MAX, PID_MIN, PID_DT, PID_ERROR_CLAMP)
 
         self._lock = threading.Lock()
         self._ox = 0.0
@@ -155,6 +165,11 @@ class PIDControlLoop:
             pid.Ki = max(0, round(pid.Ki + delta, 4))
         elif gain == 'kd':
             pid.Kd = max(0, round(pid.Kd + delta, 4))
+
+    def adjust_error_clamp(self, delta: int):
+        """Thread-safe error_clamp adjustment from main thread."""
+        self.pid_x.error_clamp = max(20, (self.pid_x.error_clamp or PID_ERROR_CLAMP) + delta)
+        self.pid_y.error_clamp = max(20, (self.pid_y.error_clamp or PID_ERROR_CLAMP) + delta)
 
     def reset(self, axis: str = None):
         """Clear integrator and first-sample flag."""
@@ -206,8 +221,8 @@ class KalmanTracker:
     """6-state (cx, cy, vx, vy, w, h) constant-velocity Kalman filter for rectangle tracking."""
 
     def __init__(self,
-                 process_noise: float = 0.03,
-                 measurement_noise: float = 0.1,
+                 process_noise: float = 0.05,
+                 measurement_noise: float = 0.15,
                  velocity_decay: float = 0.85):
         self.kf = cv2.KalmanFilter(6, 4)
         # State: [cx, cy, vx, vy, w, h]
@@ -618,11 +633,13 @@ class RectangleDetector:
         if self._pid_loop is not None:
             px = self._pid_loop.pid_x
             py = self._pid_loop.pid_y
+            ec = px.error_clamp if px.error_clamp is not None else 0
             lines = [
                 f"PID X: Kp={px.Kp:.3f} Ki={px.Ki:.3f} Kd={px.Kd:.3f}",
                 f"PID Y: Kp={py.Kp:.3f} Ki={py.Ki:.3f} Kd={py.Kd:.3f}",
                 f"X err={px.error:+.1f} int={px.ierror:+.1f} out={px.ctl_value:+.1f}",
                 f"Y err={py.error:+.1f} int={py.ierror:+.1f} out={py.ctl_value:+.1f}",
+                f"Error clamp: {ec}",
             ]
             x0 = result_frame.shape[1] - 320
             for i, line in enumerate(lines):
@@ -660,6 +677,7 @@ class RectangleDetector:
         print("  'h'/'n' - Ki_y +/-")
         print("  'j'/'m' - Kd_y +/-")
         print("  'r' - 清零 PID 积分")
+        print("  'o'/'l' - 误差钳位 +/- (减小可抑制转弯高速)")
 
         try:
             while True:
@@ -785,6 +803,12 @@ class RectangleDetector:
                 elif self._pid_loop is not None and key == ord('r'):
                     self._pid_loop.reset()
                     print("PID 积分已清零")
+                elif self._pid_loop is not None and key == ord('o'):
+                    self._pid_loop.adjust_error_clamp(+10)
+                    print(f"误差钳位: {self._pid_loop.pid_x.error_clamp}")
+                elif self._pid_loop is not None and key == ord('l'):
+                    self._pid_loop.adjust_error_clamp(-10)
+                    print(f"误差钳位: {self._pid_loop.pid_x.error_clamp}")
 
         finally:
             if self._pid_loop is not None:
