@@ -353,8 +353,8 @@ def order_corners(pts: np.ndarray) -> np.ndarray:
 class CircleTracer:
     """Project a physical circle (mm) on A4 paper to an image ellipse via homography."""
 
-    def __init__(self, paper_w: float = 210, paper_h: float = 297,
-                 radius_mm: float = 30, num_points: int = 72):
+    def __init__(self, paper_w: float = 297, paper_h: float = 210,
+                 radius_mm: float = 60, num_points: int = 72):
         self.paper_w = paper_w
         self.paper_h = paper_h
         self.radius_mm = radius_mm
@@ -406,6 +406,17 @@ class CircleTracer:
             return None
         idx = int(progress * self.num_points) % self.num_points
         return tuple(self.circle_points_image[idx])
+
+    def get_point_by_angle(self, angle: float):
+        """Return the image point for a given angle (radians) on the circle.
+        Computes directly from angle via homography for smooth continuous tracing."""
+        if self.H is None:
+            return None
+        px = self.cx_mm + self.radius_mm * np.cos(angle)
+        py = self.cy_mm + self.radius_mm * np.sin(angle)
+        pt = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
+        img_pt = cv2.perspectiveTransform(pt, self.H).reshape(-1, 2)
+        return tuple(img_pt[0])
 
 
 # ============================================================
@@ -466,7 +477,7 @@ class RectangleDetector:
         self._circle_angle = 0.0              # 当前角度 (rad)
         self._circle_speed = 6.28             # 角速度 rad/s (≈1圈/秒)
         self._circle_start_time = None        # 首次检测到矩形的时间戳
-        self._circle_delay = 1.0              # 检测稳定后等待秒数再开始画圆
+        self._circle_delay = 0.2              # 检测稳定后等待秒数再开始画圆
 
         # PID 控制
         self._enable_pid = enable_pid
@@ -785,9 +796,9 @@ class RectangleDetector:
         if self._circle_tracer.circle_points_image is not None:
             pts = self._circle_tracer.circle_points_image.astype(np.int32)
             cv2.polylines(result_frame, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
-            # 当前目标点 (红色实心)
-            progress = (self._circle_angle % (2 * np.pi)) / (2 * np.pi)
-            pt = self._circle_tracer.get_point(progress)
+            # 当前目标点 (红色实心) — 按角度连续计算
+            angle = self._circle_angle % (2 * np.pi)
+            pt = self._circle_tracer.get_point_by_angle(angle)
             if pt is not None:
                 cv2.circle(result_frame, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), -1)
 
@@ -904,11 +915,11 @@ class RectangleDetector:
 
                         # PID 目标计算
                         if self._pid_loop is not None:
-                            if self._circle_mode and self._circle_tracer.circle_points_image is not None:
-                                # 圆形模式: 目标 = 圆上当前点
+                            if self._circle_mode and self._circle_tracer.H is not None:
+                                # 圆形模式: 目标 = 圆上当前点 (按角度连续计算)
                                 self._circle_angle += self._circle_speed * dt
-                                progress = (self._circle_angle % (2 * np.pi)) / (2 * np.pi)
-                                pt = self._circle_tracer.get_point(progress)
+                                angle = self._circle_angle % (2 * np.pi)
+                                pt = self._circle_tracer.get_point_by_angle(angle)
                                 if pt is not None:
                                     ox = pt[0] - self.frame_center_x
                                     oy = -(pt[1] - self.frame_center_y)
