@@ -331,6 +331,84 @@ class EMASmoother:
 
 
 # ============================================================
+# 透视投影: 纸上圆 → 图像椭圆 (homography)
+# ============================================================
+
+def order_corners(pts: np.ndarray) -> np.ndarray:
+    """Order 4 corner points as TL, TR, BR, BL using y-then-x sort."""
+    pts = np.array(pts, dtype=np.float32).reshape(4, 2)
+    # 按 y 坐标排序, 上半部分 = TL+TR, 下半部分 = BL+BR
+    sorted_y = pts[np.argsort(pts[:, 1])]
+    top2 = sorted_y[:2]
+    bot2 = sorted_y[2:]
+    # 上半部分: 小 x = TL, 大 x = TR
+    tl = top2[np.argmin(top2[:, 0])]
+    tr = top2[np.argmax(top2[:, 0])]
+    # 下半部分: 小 x = BL, 大 x = BR
+    bl = bot2[np.argmin(bot2[:, 0])]
+    br = bot2[np.argmax(bot2[:, 0])]
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
+class CircleTracer:
+    """Project a physical circle (mm) on A4 paper to an image ellipse via homography."""
+
+    def __init__(self, paper_w: float = 210, paper_h: float = 297,
+                 radius_mm: float = 30, num_points: int = 72):
+        self.paper_w = paper_w
+        self.paper_h = paper_h
+        self.radius_mm = radius_mm
+        self.num_points = num_points
+
+        # A4 corners in paper coordinates (mm)
+        self.paper_corners = np.array([
+            [0, 0],
+            [paper_w, 0],
+            [paper_w, paper_h],
+            [0, paper_h],
+        ], dtype=np.float32)
+
+        # Circle center = paper center
+        self.cx_mm = paper_w / 2.0
+        self.cy_mm = paper_h / 2.0
+
+        # Pre-compute circle points in paper coordinates (mm)
+        self.circle_points_paper = self._generate_circle()
+
+        # Computed each frame from homography
+        self.H = None                    # 3×3 homography matrix
+        self.circle_points_image = None  # N×2 array in image pixels
+
+    def _generate_circle(self) -> np.ndarray:
+        angles = np.linspace(0, 2 * np.pi, self.num_points, endpoint=False)
+        pts = np.zeros((self.num_points, 2), dtype=np.float32)
+        pts[:, 0] = self.cx_mm + self.radius_mm * np.cos(angles)
+        pts[:, 1] = self.cy_mm + self.radius_mm * np.sin(angles)
+        return pts
+
+    def update_homography(self, image_corners: np.ndarray):
+        """Compute homography from 4 image corners and project circle to image."""
+        if image_corners is None or image_corners.shape != (4, 2):
+            self.H = None
+            self.circle_points_image = None
+            return
+        self.H, mask = cv2.findHomography(self.paper_corners,
+                                           image_corners.astype(np.float32))
+        if self.H is not None and mask is not None and mask[0]:
+            pts = self.circle_points_paper.reshape(-1, 1, 2)
+            self.circle_points_image = cv2.perspectiveTransform(pts, self.H).reshape(-1, 2)
+        else:
+            self.circle_points_image = None
+
+    def get_point(self, progress: float):
+        """Return a single point on the image ellipse. progress: 0.0 ~ 1.0."""
+        if self.circle_points_image is None:
+            return None
+        idx = int(progress * self.num_points) % self.num_points
+        return tuple(self.circle_points_image[idx])
+
+
+# ============================================================
 # 矩形检测器 (保留原有逻辑, 新增 PID 控制)
 # ============================================================
 
@@ -381,6 +459,14 @@ class RectangleDetector:
         self._ema = EMASmoother(alpha=0.35)   # 0.35 = 适中平滑; 增大响应更快, 减小更平滑
         self.detection_iou_threshold = 0.25    # 新检测与预测框 IoU 低于此值视为野值
         self.pid_deadband = 5                  # PID 死区(像素): |误差| < 此值时输出0, 消除微振
+
+        # 圆形追踪
+        self._circle_tracer = CircleTracer()
+        self._circle_mode = False             # True=画圆, False=中心锁定
+        self._circle_angle = 0.0              # 当前角度 (rad)
+        self._circle_speed = 6.28             # 角速度 rad/s (≈1圈/秒)
+        self._circle_start_time = None        # 首次检测到矩形的时间戳
+        self._circle_delay = 1.0              # 检测稳定后等待秒数再开始画圆
 
         # PID 控制
         self._enable_pid = enable_pid
@@ -448,11 +534,14 @@ class RectangleDetector:
 
             if len(approx) == 4:
                 pts = approx.reshape(4, 2)
+                corners = order_corners(pts)
                 center = line_intersection(pts[0], pts[2], pts[1], pts[3])
                 if center is None:
                     center = (x + w_box // 2, y + h_box // 2)
             else:
                 center = (x + w_box // 2, y + h_box // 2)
+                rect_mm = cv2.minAreaRect(contour)
+                corners = order_corners(cv2.boxPoints(rect_mm))
 
             cx, cy = center
             return {
@@ -464,6 +553,7 @@ class RectangleDetector:
                 'area': rect_area,
                 'contour': approx,
                 'contour_idx': idx,
+                'corners': corners,
             }
 
         for i, cnt in enumerate(contours):
@@ -571,6 +661,8 @@ class RectangleDetector:
                 self.disappear_counter = 0
                 self.detection_counter = 1
                 result = self._build_output_rect(current_rect, meas_cx, meas_cy, meas_w, meas_h)
+                if 'corners' in current_rect:
+                    result['corners'] = current_rect['corners']
                 self.smoothed_rect = result
                 self.last_valid_rect = result
                 return [result]
@@ -605,6 +697,8 @@ class RectangleDetector:
             ema_cx, ema_cy, ema_w, ema_h = self._ema.smooth(kf_cx, kf_cy, kf_w, kf_h)
 
             result = self._build_output_rect(current_rect, ema_cx, ema_cy, ema_w, ema_h, kf_vx, kf_vy)
+            if 'corners' in current_rect:
+                result['corners'] = current_rect['corners']
             self.disappear_counter = 0
             self.detection_counter = min(self.detection_counter + 1, 999)
             self.smoothed_rect = result
@@ -687,7 +781,18 @@ class RectangleDetector:
                 cv2.drawContours(result_frame, [target_rect['inner_rect']['contour']], -1,
                                  (0, 0, 255), 1)
 
-        status_text = f"Detect: {self.detection_counter}  KF: {'on' if self._kf.initialized else 'off'}"
+        # 透视投影圆形 (红色)
+        if self._circle_tracer.circle_points_image is not None:
+            pts = self._circle_tracer.circle_points_image.astype(np.int32)
+            cv2.polylines(result_frame, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+            # 当前目标点 (红色实心)
+            progress = (self._circle_angle % (2 * np.pi)) / (2 * np.pi)
+            pt = self._circle_tracer.get_point(progress)
+            if pt is not None:
+                cv2.circle(result_frame, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), -1)
+
+        mode_str = "CIRCLE" if self._circle_mode else "CENTER"
+        status_text = f"{mode_str}  D:{self.detection_counter}  KF:{'on' if self._kf.initialized else 'off'}"
         cv2.putText(result_frame, status_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
@@ -728,6 +833,7 @@ class RectangleDetector:
         last_frame = None
         last_edges = None
         last_rectangles: List[Dict[str, Any]] = []
+        last_frame_time = time.perf_counter()
 
         # 启动 PID 控制线程
         if self._pid_loop is not None:
@@ -753,6 +859,8 @@ class RectangleDetector:
         print("  '1'/'2' - EMA 平滑 alpha +/- (越大响应越快)")
         print("  '3'/'4' - IoU 野值阈值 +/-")
         print("  '5'/'6' - PID 死区 +/- (增大抑制微振)")
+        print("  'c' - 切换圆形/中心模式")
+        print("  '7'/'8' - 圆形速度 +/-")
 
         try:
             while True:
@@ -769,16 +877,53 @@ class RectangleDetector:
                     last_edges = edges.copy() if edges is not None else None
                     last_rectangles = smoothed_rectangles
 
-                    # 更新 PID 目标 (预测框不驱动电机, 防止偏离)
+                    # 更新 homography 和 PID 目标
+                    now = time.perf_counter()
+                    dt = now - last_frame_time
+                    last_frame_time = now
+
                     if len(smoothed_rectangles) > 0:
                         target_rect = smoothed_rectangles[0]
                         is_predicted = target_rect.get('predicted', False)
-                        ox = target_rect['offset_x']
-                        oy = -target_rect['offset_y']  # 图像 y 轴翻转
+
+                        # 更新圆形投影 (有真实检测 + 有角点时)
+                        if not is_predicted and 'corners' in target_rect:
+                            self._circle_tracer.update_homography(target_rect['corners'])
+                            if self._circle_start_time is None:
+                                self._circle_start_time = time.time()
+                        elif is_predicted:
+                            # 预测中不更新 homography, 也不重置计时器
+                            pass
+
+                        # 自动启动圆形模式: 检测稳定超过延时
+                        if (not self._circle_mode and self._circle_start_time is not None
+                                and time.time() - self._circle_start_time >= self._circle_delay):
+                            self._circle_mode = True
+                            self._circle_angle = 0.0
+                            print(f"圆形追踪启动 (速度: {self._circle_speed:.1f} rad/s)")
+
+                        # PID 目标计算
                         if self._pid_loop is not None:
-                            # 仅真实检测驱动电机; 预测仅用于 Kalman 内部状态保持
-                            self._pid_loop.update_target(ox, oy, not is_predicted)
+                            if self._circle_mode and self._circle_tracer.circle_points_image is not None:
+                                # 圆形模式: 目标 = 圆上当前点
+                                self._circle_angle += self._circle_speed * dt
+                                progress = (self._circle_angle % (2 * np.pi)) / (2 * np.pi)
+                                pt = self._circle_tracer.get_point(progress)
+                                if pt is not None:
+                                    ox = pt[0] - self.frame_center_x
+                                    oy = -(pt[1] - self.frame_center_y)
+                                    self._pid_loop.update_target(ox, oy, True)
+                            else:
+                                # 中心锁定模式
+                                ox = target_rect['offset_x']
+                                oy = -target_rect['offset_y']
+                                self._pid_loop.update_target(ox, oy, not is_predicted)
                     else:
+                        # 目标丢失: 重置圆形状态
+                        if self._circle_start_time is not None:
+                            self._circle_mode = False
+                            self._circle_start_time = None
+                            self._circle_angle = 0.0
                         if self._pid_loop is not None:
                             self._pid_loop.update_target(0, 0, False)
 
@@ -904,6 +1049,19 @@ class RectangleDetector:
                 elif self._pid_loop is not None and key == ord('6'):
                     self._pid_loop.adjust_deadband(-1)
                     print(f"PID 死区: {self._pid_loop._deadband} px")
+                # ---- 圆形追踪控制 ----
+                elif key == ord('c'):
+                    self._circle_mode = not self._circle_mode
+                    self._circle_angle = 0.0
+                    if self._circle_mode:
+                        self._circle_start_time = time.time()
+                    print(f"圆形追踪: {'ON' if self._circle_mode else 'OFF'}")
+                elif key == ord('7'):
+                    self._circle_speed = min(20.0, self._circle_speed + 1.0)
+                    print(f"圆形速度: {self._circle_speed:.1f} rad/s")
+                elif key == ord('8'):
+                    self._circle_speed = max(0.5, self._circle_speed - 1.0)
+                    print(f"圆形速度: {self._circle_speed:.1f} rad/s")
 
         finally:
             if self._pid_loop is not None:
@@ -934,7 +1092,7 @@ def main() -> None:
     try:
         # ========== 配置区 ==========
         # 选择1：使用摄像头
-        detector = RectangleDetector(source=11, enable_pid=True)
+        detector = RectangleDetector(source=0, enable_pid=False)
 
         # 选择2：使用视频文件（取消注释下面两行，注释上面那行）
         # video_path = "test.mp4"
