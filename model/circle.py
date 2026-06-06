@@ -45,11 +45,19 @@ PID_Y_KP = 1.4
 PID_Y_KI = 0.4
 PID_Y_KD = 0.1
 
-PID_MAX = 3000
-PID_MIN = -3000
+PID_MAX = 5000
+PID_MIN = -5000
 
 # 误差钳位: 转弯时画面偏移可达几百像素, 限制输入避免 PID 输出过大导致高速转动
-PID_ERROR_CLAMP = 120
+PID_ERROR_CLAMP = 300
+
+# 距离自适应: 参考对角线(2.5m处矩形对角线像素值), 用于归一化误差
+PID_REF_DIAG = 150
+PID_SCALE_MIN = 0.2   # 近处缩放下限, 防止过激
+PID_SCALE_MAX = 2.0   # 远处缩放上限
+
+# 速度前馈增益 (Kalman速度 → 电机输出)
+PID_FF_GAIN = 3.0
 
 # 增益调节步长
 PID_KP_STEP = 0.01
@@ -133,16 +141,22 @@ class PIDControlLoop:
         self._lock = threading.Lock()
         self._ox = 0.0
         self._oy = 0.0
+        self._vx = 0.0
+        self._vy = 0.0
         self._has_target = False
         self._deadband = 5              # PID 死区 (像素), |误差| < 此值时输出0
+        self._ff_gain = PID_FF_GAIN    # 速度前馈增益
         self._running = False
         self._thread = None
 
-    def update_target(self, ox: float, oy: float, has_target: bool):
-        """Called from main thread each frame with latest offsets."""
+    def update_target(self, ox: float, oy: float, has_target: bool,
+                       vx: float = 0.0, vy: float = 0.0):
+        """Called from main thread each frame with latest offsets and Kalman velocity."""
         with self._lock:
             self._ox = ox
             self._oy = oy
+            self._vx = vx
+            self._vy = vy
             self._has_target = has_target
 
     def start(self):
@@ -176,6 +190,10 @@ class PIDControlLoop:
         """Thread-safe deadband adjustment from main thread."""
         self._deadband = max(0, self._deadband + delta)
 
+    def adjust_ff_gain(self, delta: float):
+        """Thread-safe feedforward gain adjustment from main thread."""
+        self._ff_gain = max(0, round(self._ff_gain + delta, 2))
+
     def reset(self, axis: str = None):
         """Clear integrator and first-sample flag."""
         for pid, label in [(self.pid_x, 'x'), (self.pid_y, 'y')]:
@@ -191,6 +209,8 @@ class PIDControlLoop:
             with self._lock:
                 ox = self._ox
                 oy = self._oy
+                vx = self._vx
+                vy = self._vy
                 has_target = self._has_target
 
             if has_target:
@@ -203,6 +223,11 @@ class PIDControlLoop:
                     oy = 0.0
                 ctl_x = self.pid_x.step(ox, 0)
                 ctl_y = self.pid_y.step(oy, 0)
+                # 速度前馈: Kalman预估速度直接驱动, PID只修正残差
+                ctl_x += self._ff_gain * vx
+                ctl_y += self._ff_gain * vy
+                ctl_x = max(PID_MIN, min(PID_MAX, ctl_x))
+                ctl_y = max(PID_MIN, min(PID_MAX, ctl_y))
             else:
                 # 目标丢失: 清零 PID 防止 D 项尖峰, 电机立即停止
                 if not _was_lost:
@@ -447,8 +472,8 @@ class RectangleDetector:
         self.frame_center_x = actual_width // 2
         self.frame_center_y = actual_height // 2 + 20
 
-        self.min_area = 2000
-        self.max_area = 200000
+        self.min_area = 200
+        self.max_area = 500000
         self.canny_low_threshold = 50
         self.canny_high_threshold = 150
         self.blur_kernel_size = 5
@@ -759,9 +784,6 @@ class RectangleDetector:
                               (sr['x'], sr['y']),
                               (sr['x'] + sr['width'], sr['y'] + sr['height']),
                               (0, 255, 0), 2)
-                cv2.putText(result_frame, "Outer",
-                            (sr['x'], sr['y'] - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 if sr.get('inner_rect') is not None:
                     ir = sr['inner_rect']
@@ -769,9 +791,6 @@ class RectangleDetector:
                                   (ir['x'], ir['y']),
                                   (ir['x'] + ir['width'], ir['y'] + ir['height']),
                                   (255, 0, 0), 2)
-                    cv2.putText(result_frame, "Inner",
-                                (ir['x'], ir['y'] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
                 cv2.circle(result_frame, (sr['center_x'], sr['center_y']),
                            6, (0, 255, 0), -1)
@@ -827,7 +846,7 @@ class RectangleDetector:
                 f"PID Y: Kp={py.Kp:.3f} Ki={py.Ki:.3f} Kd={py.Kd:.3f}",
                 f"X err={px.error:+.1f} int={px.ierror:+.1f} out={px.ctl_value:+.1f}",
                 f"Y err={py.error:+.1f} int={py.ierror:+.1f} out={py.ctl_value:+.1f}",
-                f"Clamp:{ec}  Dead:{db}  EMA:{self._ema.alpha:.2f}  IoUth:{self.detection_iou_threshold:.2f}",
+                f"Clamp:{ec}  Dead:{db}  FF:{self._pid_loop._ff_gain:.1f}  EMA:{self._ema.alpha:.2f}  IoUth:{self.detection_iou_threshold:.2f}",
             ]
             x0 = result_frame.shape[1] - 380
             for i, line in enumerate(lines):
@@ -872,6 +891,7 @@ class RectangleDetector:
         print("  '5'/'6' - PID 死区 +/- (增大抑制微振)")
         print("  'c' - 切换圆形/中心模式")
         print("  '7'/'8' - 圆形速度 +/-")
+        print("  '9'/'0' - 前馈增益 +/-")
 
         try:
             while True:
@@ -913,6 +933,12 @@ class RectangleDetector:
                             self._circle_angle = 0.0
                             print(f"圆形追踪启动 (速度: {self._circle_speed:.1f} rad/s)")
 
+                        # 距离自适应缩放: 矩形越大(越近)误差同比放大, 缩小给PID保持响应一致
+                        rect_w = target_rect.get('width', PID_REF_DIAG)
+                        rect_h = target_rect.get('height', PID_REF_DIAG)
+                        rect_diag = max(1.0, np.sqrt(float(rect_w)**2 + float(rect_h)**2))
+                        dist_scale = np.clip(PID_REF_DIAG / rect_diag, PID_SCALE_MIN, PID_SCALE_MAX)
+
                         # PID 目标计算
                         if self._pid_loop is not None:
                             if self._circle_mode and self._circle_tracer.H is not None:
@@ -921,14 +947,16 @@ class RectangleDetector:
                                 angle = self._circle_angle % (2 * np.pi)
                                 pt = self._circle_tracer.get_point_by_angle(angle)
                                 if pt is not None:
-                                    ox = pt[0] - self.frame_center_x
-                                    oy = -(pt[1] - self.frame_center_y)
+                                    ox = (pt[0] - self.frame_center_x) * dist_scale
+                                    oy = -(pt[1] - self.frame_center_y) * dist_scale
                                     self._pid_loop.update_target(ox, oy, True)
                             else:
-                                # 中心锁定模式
-                                ox = target_rect['offset_x']
-                                oy = -target_rect['offset_y']
-                                self._pid_loop.update_target(ox, oy, not is_predicted)
+                                # 中心锁定模式 — 附 Kalman 速度前馈
+                                ox = target_rect['offset_x'] * dist_scale
+                                oy = -target_rect['offset_y'] * dist_scale
+                                vx = target_rect.get('velocity_x', 0)
+                                vy = target_rect.get('velocity_y', 0)
+                                self._pid_loop.update_target(ox, oy, not is_predicted, vx, vy)
                     else:
                         # 目标丢失: 重置圆形状态
                         if self._circle_start_time is not None:
@@ -947,14 +975,10 @@ class RectangleDetector:
                             fps_time = time.time()
 
                     result_frame = self.draw_result(last_frame, last_rectangles, paused=paused)
-                    current_edges = last_edges
-
                     cv2.putText(result_frame, f"FPS: {fps}", (10, result_frame.shape[0] - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
                     cv2.imshow("Rectangle Detection", result_frame)
-                    if current_edges is not None:
-                        cv2.imshow("Edges", current_edges)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
@@ -1073,6 +1097,12 @@ class RectangleDetector:
                 elif key == ord('8'):
                     self._circle_speed = max(0.5, self._circle_speed - 1.0)
                     print(f"圆形速度: {self._circle_speed:.1f} rad/s")
+                elif self._pid_loop is not None and key == ord('9'):
+                    self._pid_loop.adjust_ff_gain(+0.5)
+                    print(f"前馈增益: {self._pid_loop._ff_gain:.1f}")
+                elif self._pid_loop is not None and key == ord('0'):
+                    self._pid_loop.adjust_ff_gain(-0.5)
+                    print(f"前馈增益: {self._pid_loop._ff_gain:.1f}")
 
         finally:
             if self._pid_loop is not None:
